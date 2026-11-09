@@ -1,292 +1,278 @@
-#include "BlackmagicRawAPI.h"
-#include "BlackmagicRawAPIDispatch.cpp"
+#include "braw_decoder.h"
+#include "image_writer.h"
 
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <iomanip>
 #include <iostream>
-#include <sys/stat.h>
-#include <sys/dir.h>
+#include <string>
+#include <vector>
 
-#include <CoreFoundation/CoreFoundation.h>
-#include <CoreServices/CoreServices.h>
-#include <CoreGraphics/CoreGraphics.h>
-#include <ImageIO/ImageIO.h>
+namespace fs = std::filesystem;
 
-#ifdef DEBUG
-    #include <cassert>
-    #define VERIFY(condition) assert(SUCCEEDED(condition))
-#else
-    #define VERIFY(condition) condition
-#endif
+namespace {
 
-BlackmagicRawResourceFormat s_resourceFormat = blackmagicRawResourceFormatRGBAU8;
-
-static const CFStringRef s_brawSdkPath = CFSTR("/Applications/Blackmagic RAW/Blackmagic RAW SDK/Mac/Libraries");
-CFStringRef s_outputFileName = CFSTR("/tmp/outputRGBAU8.png");
-
-static void OutputImage(CFStringRef outputFileName, uint32_t width, uint32_t height, uint32_t sizeBytes, void* imageData)
-{
-    bool success = false;
-    const char* outputFileNameAsCString = CFStringGetCStringPtr(outputFileName, kCFStringEncodingMacRoman);
-
-    CFURLRef file = CFURLCreateWithFileSystemPath(kCFAllocatorDefault, outputFileName, kCFURLPOSIXPathStyle, false);
-    if (file != nullptr)
-    {
-        const uint32_t bitsPerComponent	= 8;
-        const uint32_t bitsPerPixel		= 32;
-        const uint32_t bytesPerRow		= (bitsPerPixel * width) / 8U;
-
-        CGColorSpaceRef space			= CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-        CGBitmapInfo bitmapInfo			= kCGImageAlphaNoneSkipLast | kCGImageByteOrderDefault;
-        CGDataProviderRef provider		= CGDataProviderCreateWithData(nullptr, imageData, sizeBytes, nullptr);
-        const CGFloat* decode			= nullptr;
-        bool shouldInterpolate			= false;
-        CGColorRenderingIntent intent	= kCGRenderingIntentDefault;
-
-        CGImageRef imageRef = CGImageCreate(width, height, bitsPerComponent, bitsPerPixel, bytesPerRow, space, bitmapInfo, provider, decode, shouldInterpolate, intent);
-        if (imageRef != nullptr)
-        {
-            CGImageDestinationRef destination = CGImageDestinationCreateWithURL(file, kUTTypePNG, 1, nullptr);
-            if (destination)
-            {
-                CGImageDestinationAddImage(destination, imageRef, nil);
-                CGImageDestinationFinalize(destination);
-
-                CFRelease(destination);
-
-                std::cout << "Created " << outputFileNameAsCString << std::endl;
-                success = true;
-            }
-
-            CGImageRelease(imageRef);
-        }
-
-        CGDataProviderRelease(provider);
-        CGColorSpaceRelease(space);
-
-        CFRelease(file);
-    }
-
-    if (! success)
-        std::cerr << "Failed to create " << outputFileNameAsCString << "!" << std::endl;
-}
-
-class CameraCodecCallback : public IBlackmagicRawCallback {
-public:
-    explicit CameraCodecCallback() = default;
-    ~CameraCodecCallback() override = default;
-
-    void ReadComplete(IBlackmagicRawJob* job, HRESULT result, IBlackmagicRawFrame* frame) override {
-        IBlackmagicRawJob* procJob = nullptr;
-
-        if (result == S_OK)
-            VERIFY(frame->SetResourceFormat(s_resourceFormat));
-
-        if (result == S_OK)
-            result = frame->CreateJobDecodeAndProcessFrame(nullptr, nullptr, &procJob);
-
-        if (result == S_OK)
-            result = procJob->Submit();
-
-        if (result != S_OK)
-        {
-            if (procJob)
-                procJob->Release();
-        }
-
-        job->Release();
-    }
-
-    void ProcessComplete(IBlackmagicRawJob* job, HRESULT result, IBlackmagicRawProcessedImage* processedImage) override {
-        unsigned int width = 0;
-        unsigned int height = 0;
-        unsigned int sizeBytes = 0;
-        void* imageData = nullptr;
-
-        if (result == S_OK)
-            result = processedImage->GetWidth(&width);
-
-        if (result == S_OK)
-            result = processedImage->GetHeight(&height);
-
-        if (result == S_OK)
-            result = processedImage->GetResourceSizeBytes(&sizeBytes);
-
-        if (result == S_OK)
-            result = processedImage->GetResource(&imageData);
-
-        if (result == S_OK)
-            OutputImage(s_outputFileName, width, height, sizeBytes, imageData);
-
-        job->Release();
-    }
-    void DecodeComplete(IBlackmagicRawJob*, HRESULT) override {}
-    void TrimProgress(IBlackmagicRawJob*, float) override {}
-    void TrimComplete(IBlackmagicRawJob*, HRESULT) override {}
-    void SidecarMetadataParseWarning(IBlackmagicRawClip*, CFStringRef, uint32_t, CFStringRef) override {}
-    void SidecarMetadataParseError(IBlackmagicRawClip*, CFStringRef, uint32_t, CFStringRef) override {}
-    void PreparePipelineComplete(void*, HRESULT) override {}
-
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, LPVOID*) override
-    {
-        return E_NOTIMPL;
-    }
-
-    ULONG STDMETHODCALLTYPE AddRef() override
-    {
-        return 0;
-    }
-
-    ULONG STDMETHODCALLTYPE Release() override
-    {
-        return 0;
-    }
+struct Options {
+    fs::path inputDirectory;
+    fs::path outputDirectory;
+    fs::path sdkPath;
+    braw::OutputFormat format = braw::OutputFormat::Dng;
+    uint64_t frameIndex = 0;
 };
 
-int main(int argc, char** argv) {
-    std::string outDir;
-    std::string inDir;
-    std::string outputFormat;
+void printUsage(const char* program) {
+    std::cout
+        << "Usage: " << program << " -i <input directory> -o <output directory> [-f dng|png]\n"
+        << "\n"
+        << "  -i, --inDir <directory>         directory containing .braw files\n"
+        << "  -o, --outDir <directory>        directory to write converted stills to\n"
+        << "  -f, --outputFormat <dng|png>    output format (default: dng)\n"
+        << "      --frame <index>             frame to extract (default: 0)\n"
+        << "      --sdkPath <directory>       Blackmagic RAW SDK libraries folder\n"
+        << "  -h, --help                      show this message\n";
+}
 
-    for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "-f" || std::string(argv[i]) == "--outputFormat") {
-            if (i + 1 < argc) {
-                outputFormat = argv[++i];
-            } else {
-                std::cerr << "--outputFormat option requires one argument." << std::endl;
-                return 1;
+bool parseFormat(const std::string& value, braw::OutputFormat& format) {
+    std::string lowered = value;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                   [](unsigned char character) { return static_cast<char>(std::tolower(character)); });
+    if (lowered == "dng") {
+        format = braw::OutputFormat::Dng;
+        return true;
+    }
+    if (lowered == "png") {
+        format = braw::OutputFormat::Png;
+        return true;
+    }
+    return false;
+}
+
+bool parseArguments(int argc, char** argv, Options& options, bool& helpRequested, std::string& error) {
+    for (int index = 1; index < argc; ++index) {
+        const std::string argument = argv[index];
+        auto nextValue = [&](const char* optionName, std::string& value) {
+            if (index + 1 >= argc) {
+                error = std::string(optionName) + " requires an argument";
+                return false;
             }
-        } else if (std::string(argv[i]) == "-i" || std::string(argv[i]) == "--inDir") {
-            if (i + 1 < argc) {
-                inDir = argv[++i];
-            } else {
-                std::cerr << "--inDir option requires one argument." << std::endl;
-                return 1;
+            value = argv[++index];
+            return true;
+        };
+
+        std::string value;
+        if (argument == "-h" || argument == "--help") {
+            helpRequested = true;
+            return true;
+        }
+        if (argument == "-i" || argument == "--inDir") {
+            if (!nextValue("--inDir", value))
+                return false;
+            options.inputDirectory = fs::u8path(value);
+        } else if (argument == "-o" || argument == "--outDir") {
+            if (!nextValue("--outDir", value))
+                return false;
+            options.outputDirectory = fs::u8path(value);
+        } else if (argument == "-f" || argument == "--outputFormat") {
+            if (!nextValue("--outputFormat", value))
+                return false;
+            if (!parseFormat(value, options.format)) {
+                error = "unknown output format '" + value + "' (expected dng or png)";
+                return false;
             }
-        } else if (std::string(argv[i]) == "-o" || std::string(argv[i]) == "--outDir") {
-            if (i + 1 < argc) {
-                outDir = argv[++i];
-            } else {
-                std::cerr << "--outDir option requires one argument." << std::endl;
-                return 1;
+        } else if (argument == "--frame") {
+            if (!nextValue("--frame", value))
+                return false;
+            try {
+                options.frameIndex = std::stoull(value);
+            } catch (const std::exception&) {
+                error = "invalid frame index '" + value + "'";
+                return false;
             }
+        } else if (argument == "--sdkPath") {
+            if (!nextValue("--sdkPath", value))
+                return false;
+            options.sdkPath = fs::u8path(value);
+        } else {
+            error = "unknown option '" + argument + "'";
+            return false;
         }
     }
+    return true;
+}
 
-    if (outputFormat.empty() || inDir.empty()) {
-        std::cerr << "Usage: " << argv[0] << " -o/--outputFormat <outputFormat> -i/--inDir <inDir>" << std::endl;
-        return 1;
+bool hasBrawExtension(const fs::path& path) {
+    std::string extension = path.extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+                   [](unsigned char character) { return static_cast<char>(std::tolower(character)); });
+    return extension == ".braw";
+}
+
+std::vector<fs::path> collectClips(const fs::path& directory, std::string& error) {
+    std::vector<fs::path> clips;
+    std::error_code code;
+    for (fs::directory_iterator entry(directory, code), end; !code && entry != end; entry.increment(code)) {
+        std::error_code statusCode;
+        if (!entry->is_regular_file(statusCode) || statusCode)
+            continue;
+        if (hasBrawExtension(entry->path()))
+            clips.push_back(entry->path());
+    }
+    if (code) {
+        error = "failed to read '" + directory.string() + "': " + code.message();
+        return {};
+    }
+    std::sort(clips.begin(), clips.end());
+    return clips;
+}
+
+fs::path outputPathFor(const Options& options, const fs::path& clip) {
+    return options.outputDirectory /
+           (clip.stem().string() +
+            (options.format == braw::OutputFormat::Dng ? ".dng" : ".png"));
+}
+
+bool convertClip(const Options& options, const fs::path& clip) {
+    braw::RenderOptions renderOptions;
+    renderOptions.format = options.format;
+    renderOptions.sdkLibraryPath = options.sdkPath;
+    renderOptions.frameIndex = options.frameIndex;
+
+    braw::RenderResult rendered;
+    std::string error;
+
+    const auto start = std::chrono::steady_clock::now();
+    if (!braw::renderFrame(clip, renderOptions, rendered, error)) {
+        std::cerr << "  error: " << error << std::endl;
+        return false;
     }
 
-    if (outputFormat == "png") {
-        s_resourceFormat = blackmagicRawResourceFormatRGBAU8;
-    } else if (outputFormat == "dng") {
-        s_resourceFormat = blackmagicRawResourceFormatRGBF16;
+    const fs::path outputPath = outputPathFor(options, clip);
+    bool written = false;
+    if (options.format == braw::OutputFormat::Png) {
+        written = image_writer::writePng(outputPath, rendered.width, rendered.height,
+                                         rendered.rgba, error);
     } else {
-        std::cerr << "Unknown output format: " << outputFormat << std::endl;
+        image_writer::DngImage image;
+        image.width = rendered.width;
+        image.height = rendered.height;
+        image.rgb = rendered.rgb.data();
+        image.whiteLevel = rendered.whiteLevel;
+        image.make = "Blackmagic Design";
+        image.model = rendered.cameraType;
+        image.uniqueCameraModel =
+            rendered.cameraType.empty() ? "Blackmagic Design" : "Blackmagic Design " + rendered.cameraType;
+        std::copy(std::begin(rendered.xyzToCamera), std::end(rendered.xyzToCamera),
+                  std::begin(image.colorMatrix1));
+        written = image_writer::writeDng(outputPath, image, error);
+    }
+
+    if (!written) {
+        std::cerr << "  error: " << error << std::endl;
+        return false;
+    }
+
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    std::cout << "  wrote " << outputPath.string() << " (" << rendered.width << "x"
+              << rendered.height;
+    if (options.format == braw::OutputFormat::Dng)
+        std::cout << ", gamut " << rendered.colorGamut;
+    std::cout << ", " << std::fixed << std::setprecision(2) << seconds << "s)" << std::endl;
+
+    if (options.format == braw::OutputFormat::Dng && rendered.maxLinearValue > 1.0f) {
+        std::cout << std::setprecision(2) << "  note: clipped highlights above 1.0 (max linear "
+                  << rendered.maxLinearValue << "); use -f png for a tone mapped preview"
+                  << std::endl;
+    }
+    return true;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    Options options;
+    bool helpRequested = false;
+    std::string error;
+
+    if (!parseArguments(argc, argv, options, helpRequested, error)) {
+        std::cerr << "error: " << error << "\n\n";
+        printUsage(argv[0]);
+        return 1;
+    }
+    if (helpRequested) {
+        printUsage(argv[0]);
+        return 0;
+    }
+
+    if (options.inputDirectory.empty() || options.outputDirectory.empty()) {
+        std::cerr << "error: both --inDir and --outDir are required\n\n";
+        printUsage(argv[0]);
         return 1;
     }
 
-    struct stat inInfo;
-    if (stat(inDir.c_str(), &inInfo) != 0) {
-        std::cerr << "Failed to stat input directory: " << inDir << std::endl;
+    std::error_code code;
+    if (!fs::is_directory(options.inputDirectory, code)) {
+        std::cerr << "error: input directory '" << options.inputDirectory.string()
+                  << "' does not exist" << std::endl;
+        return 1;
+    }
+    if (!fs::is_directory(options.outputDirectory, code)) {
+        fs::create_directories(options.outputDirectory, code);
+        if (code) {
+            std::cerr << "error: could not create output directory '"
+                      << options.outputDirectory.string() << "': " << code.message() << std::endl;
+            return 1;
+        }
+    }
+
+    if (options.sdkPath.empty()) {
+        const char* fromEnvironment = std::getenv("BRAW_SDK_PATH");
+        options.sdkPath = fromEnvironment != nullptr && *fromEnvironment != '\0'
+                              ? fs::u8path(fromEnvironment)
+                              : braw::defaultSdkLibraryPath();
+    }
+    if (options.sdkPath.empty() || !fs::is_directory(options.sdkPath, code)) {
+        std::cerr << "error: could not find the Blackmagic RAW SDK libraries. Install the "
+                     "Blackmagic RAW SDK or pass --sdkPath <directory>." << std::endl;
         return 1;
     }
 
-    struct stat outInfo;
-    if (stat(outDir.c_str(), &outInfo) != 0) {
-        std::cerr << "Failed to stat output directory: " << outDir << std::endl;
+    const std::vector<fs::path> clips = collectClips(options.inputDirectory, error);
+    if (!error.empty()) {
+        std::cerr << "error: " << error << std::endl;
+        return 1;
+    }
+    if (clips.empty()) {
+        std::cout << "No .braw files found in '" << options.inputDirectory.string() << "'."
+                  << std::endl;
+        return 0;
+    }
+
+    if (!braw::initialize(error)) {
+        std::cerr << "error: " << error << std::endl;
         return 1;
     }
 
-    std::cout << "outDir: " << outDir << std::endl;
-    std::cout << "inDir: " << inDir << std::endl;
-    std::cout << "outputFormat: " << outputFormat << std::endl;
-    std::cout << "----------" << std::endl;
+    std::cout << "Blackmagic RAW SDK: " << options.sdkPath.string() << "\n"
+              << "Input: " << options.inputDirectory.string() << "\n"
+              << "Output: " << options.outputDirectory.string() << "\n"
+              << "Format: " << (options.format == braw::OutputFormat::Dng ? "dng" : "png") << "\n"
+              << "----------" << std::endl;
 
-    DIR* dir = opendir(inDir.c_str());
-    if (dir == nullptr) {
-        std::cerr << "Failed to open input directory: " << inDir << std::endl;
-        return 1;
+    size_t failures = 0;
+    for (const fs::path& clip : clips) {
+        std::cout << clip.filename().string() << std::endl;
+        if (!convertClip(options, clip))
+            ++failures;
     }
 
-    struct dirent* file;
-    while ((file = readdir(dir)) != nullptr) {
-        if (file->d_type != DT_REG) {
-            continue;
-        }
+    braw::shutdown();
 
-        std::string fileName = file->d_name;
-        std::string extension = fileName.substr(fileName.find_last_of(".") + 1);
-        if (extension != "braw") {
-            continue;
-        }
-
-        std::string inPath = inDir + "/" + fileName;
-        std::string outPath = outDir + "/" + file->d_name + "." + outputFormat;
-
-        std::cout << "processing file " << inPath << std::endl;
-
-        CFStringRef clipName = CFStringCreateWithCString( nullptr, inPath.c_str(), kCFStringEncodingUTF8);
-        if (clipName == nullptr) {
-            std::cerr << "Failed to create CFString from input path: " << inPath << std::endl;
-            return 1;
-        }
-
-        IBlackmagicRawFactory* factory = CreateBlackmagicRawFactoryInstanceFromPath(s_brawSdkPath);
-        if (factory == nullptr) {
-            std::cerr << "Failed to create IBlackmagicRawFactory!" << std::endl;
-            return 1;
-        }
-
-        IBlackmagicRaw* codec = nullptr;
-        HRESULT result = factory->CreateCodec(&codec);
-        if (result != S_OK) {
-            std::cerr << "Failed to create IBlackmagicRaw!" << std::endl;
-            return 1;
-        }
-
-        IBlackmagicRawClip* clip = nullptr;
-        result = codec->OpenClip(clipName, &clip);
-        if (result != S_OK) {
-            std::cerr << "Failed to open IBlackmagicRawClip!" << std::endl;
-            return 1;
-        }
-
-        s_outputFileName = CFStringCreateWithCString( nullptr, outPath.c_str(), kCFStringEncodingUTF8);
-
-        CameraCodecCallback callback;
-        result = codec->SetCallback(&callback);
-        if (result != S_OK) {
-            std::cerr << "Failed to set IBlackmagicRawCallback!" << std::endl;
-            return 1;
-        }
-
-        IBlackmagicRawJob* readJob = nullptr;
-        long readTime = 0;
-        result = clip->CreateJobReadFrame(readTime, &readJob);
-        if (result != S_OK) {
-            std::cerr << "Failed to create IBlackmagicRawJob!" << std::endl;
-            return 1;
-        }
-
-        result = readJob->Submit();
-        if (result != S_OK) {
-            std::cerr << "Failed to submit IBlackmagicRawJob!" << std::endl;
-            return 1;
-        }
-
-        codec->FlushJobs();
-
-        if (clip != nullptr)
-            clip->Release();
-
-        if (codec != nullptr)
-            codec->Release();
-
-        if (factory != nullptr)
-            factory->Release();
-
-        CFRelease(clipName);
-    }
-
-    return 0;
+    std::cout << "----------\n"
+              << (clips.size() - failures) << " of " << clips.size() << " file(s) converted."
+              << std::endl;
+    return failures == 0 ? 0 : 1;
 }
