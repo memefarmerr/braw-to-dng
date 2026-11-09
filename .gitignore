@@ -39,6 +39,7 @@ test/
 *.app
 
 ### CMake ###
+build/
 CMakeLists.txt.user
 CMakeCache.txt
 CMakeFiles
